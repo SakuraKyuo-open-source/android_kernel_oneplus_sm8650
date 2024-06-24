@@ -12,10 +12,27 @@
 #include <linux/kobject.h>
 #include <linux/pm_runtime.h>
 #include <linux/nvmem-consumer.h>
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Checking whether the surge occurs */
+#include <linux/ktime.h>
+//#endif /* OPLUS_ARCH_EXTENDS */
 #include "wcd-usbss-priv.h"
 #include "wcd-usbss-reg-masks.h"
 #include "wcd-usbss-reg-shifts.h"
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+#include <soc/oplus/system/oplus_mm_kevent_fb.h>
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Add for avoiding ADSP notify wcd to switch to standy mode in the ftm mode */
+#include <soc/oplus/system/boot_mode.h>
+#include <soc/oplus/device_info.h>
+#include <soc/oplus/system/oplus_project.h>
+#ifdef OPLUS_FEATURE_CHG_BASIC
+#include <oplus_audio_switch.h>
+#endif
 
+static int boot_mode = 0;
+//#endif /* OPLUS_ARCH_EXTENDS */
 #define WCD_USBSS_I2C_NAME	"wcd-usbss-i2c-driver"
 
 #define DEFAULT_SURGE_TIMER_PERIOD_MS 15000
@@ -23,8 +40,17 @@
 #define NUM_RCO_MISC2_READ 10
 #define MIN_SURGE_TIMER_PERIOD_SEC 3
 #define MAX_SURGE_TIMER_PERIOD_SEC 20
-#define PM_RUNTIME_RESUME_CNT 5
+#if 0 //OPLUS_BUG_COMPATIBILITY
+/* increase retry time to 300ms */
+#define PM_RUNTIME_RESUME_CNT 8
+#else /* OPLUS_BUG_COMPATIBILITY */
+#define PM_RUNTIME_RESUME_CNT 60
+#endif /* OPLUS_BUG_COMPATIBILITY */
 #define PM_RUNTIME_RESUME_WAIT_US_MIN  5000
+
+//#ifdef OPLUS_BUG_COMPATIBILITY
+#define WCD_USBSS_OVP_CONFIG_4P2    1
+//endif /* OPLUS_BUG_COMPATIBILITY */
 
 enum {
 	WCD_USBSS_AUDIO_MANUAL,
@@ -57,6 +83,10 @@ static const char * const supply_names[] = {
 };
 
 static int audio_fsm_mode = WCD_USBSS_AUDIO_MANUAL;
+
+#ifdef OPLUS_FEATURE_CHG_BASIC
+unsigned char wcd_usbss_equalizer1 = 0;
+#endif
 
 /* Linearlizer coefficients for 32ohm load */
 static const struct wcd_usbss_reg_mask_val coeff_init[] = {
@@ -133,6 +163,13 @@ static int acquire_runtime_env(struct wcd_usbss_ctxt *priv)
 				priv->runtime_env_counter);
 		priv->runtime_env_counter = 0;
 	}
+
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	if ((rc < 0) && !(priv->sdam_handler && (rc == -EACCES))) {
+		mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_HEADSET_DET, MM_FB_KEY_RATELIMIT_5MIN, \
+			"pm_runtime_resume_and_get failed rc %d", rc);
+	}
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
 
 	mutex_unlock(&priv->runtime_env_counter_lock);
 
@@ -432,7 +469,9 @@ static bool wcd_usbss_is_in_reset_state(void)
 		goto done;
 
 	if (read_val != 0xFF) {
-		dev_err(wcd_usbss_ctxt_->dev, "%s: Surge check #1 failed\n", __func__);
+//#ifdef OPLUS_ARCH_EXTENDS
+		dev_err(wcd_usbss_ctxt_->dev, "%s: Surge check #1 failed, cable_status = %d\n", __func__, wcd_usbss_ctxt_->cable_status);
+//#endif /* OPLUS_ARCH_EXTENDS */
 		ret = true;
 		goto done;
 	}
@@ -446,7 +485,9 @@ static bool wcd_usbss_is_in_reset_state(void)
 		if ((read_val & 0x2) == 0)
 			break;
 		if (i == (NUM_RCO_MISC2_READ - 1)) {
-			dev_err(wcd_usbss_ctxt_->dev, "%s: Surge check #2 failed\n", __func__);
+//#ifdef OPLUS_ARCH_EXTENDS
+			dev_err(wcd_usbss_ctxt_->dev, "%s: Surge check #2 failed, cable_status = %d\n", __func__, wcd_usbss_ctxt_->cable_status);
+//#endif /* OPLUS_ARCH_EXTENDS */
 			ret = true;
 			goto done;
 		}
@@ -479,6 +520,9 @@ static bool wcd_usbss_is_in_reset_state(void)
 
 done:
 	/* All checks passed, so a negative surge ESD event has not occurred */
+//#ifdef OPLUS_ARCH_EXTENDS
+	pr_info("%s: Exit ret = %d, cable_status = %d\n", __func__, ret, wcd_usbss_ctxt_->cable_status);
+//#endif /* OPLUS_ARCH_EXTENDS */
 	return ret;
 }
 
@@ -489,6 +533,9 @@ done:
  */
 static int wcd_usbss_reset_routine(void)
 {
+//#ifdef OPLUS_ARCH_EXTENDS
+	pr_info("%s: Enter, cable_status = %d\n", __func__, wcd_usbss_ctxt_->cable_status);
+//#endif /* OPLUS_ARCH_EXTENDS */
 	/* Mark the cache as dirty to force a flush */
 	regcache_mark_dirty(wcd_usbss_ctxt_->regmap);
 	regcache_sync(wcd_usbss_ctxt_->regmap);
@@ -512,21 +559,32 @@ static int wcd_usbss_reset_routine(void)
 /* Called with switch_update_lock mutex locked */
 static void wcd_usbss_standby_control_locked(bool enter_standby)
 {
+	int rc = 0;
+
 	if (wcd_usbss_ctxt_->is_in_standby == enter_standby)
 		return;
 
 	if (enter_standby) {
 		dev_dbg(wcd_usbss_ctxt_->dev, "%s: Enabling standby mode\n",
 			__func__);
-		regmap_update_bits(wcd_usbss_ctxt_->regmap, WCD_USBSS_USB_SS_CNTL, 0x10, 0x10);
-		wcd_usbss_ctxt_->is_in_standby = true;
+		rc = regmap_update_bits(wcd_usbss_ctxt_->regmap, WCD_USBSS_USB_SS_CNTL,
+				0x10, 0x10);
+		if (rc < 0)
+			dev_err(wcd_usbss_ctxt_->dev, "%s: enter standby failed\n", __func__);
+		else
+			wcd_usbss_ctxt_->is_in_standby = true;
 	} else {
 		dev_dbg(wcd_usbss_ctxt_->dev, "%s: Disabling standby mode\n",
 			__func__);
-		regmap_update_bits(wcd_usbss_ctxt_->regmap, WCD_USBSS_USB_SS_CNTL, 0x10, 0x00);
-		/* 10ms wait recommended to get WCD USBSS out of standby */
-		usleep_range(10000, 10100);
-		wcd_usbss_ctxt_->is_in_standby = false;
+		rc = regmap_update_bits(wcd_usbss_ctxt_->regmap, WCD_USBSS_USB_SS_CNTL,
+				0x10, 0x00);
+		if (rc < 0) {
+			dev_err(wcd_usbss_ctxt_->dev, "%s: exit standby failed\n", __func__);
+		} else {
+			/* 10ms wait recommended to get WCD USBSS out of standby */
+			usleep_range(10000, 10100);
+			wcd_usbss_ctxt_->is_in_standby = false;
+		}
 	}
 }
 
@@ -629,6 +687,7 @@ static ssize_t wcd_usbss_standby_store(struct kobject *kobj,
 static int wcd_usbss_surge_kthread_fn(void *p)
 {
 	while (!kthread_should_stop()) {
+#if 0 //OPLUS_BUG_COMPATIBILITY
 		if (acquire_runtime_env(wcd_usbss_ctxt_) >= 0) {
 
 			if (wcd_usbss_ctxt_->surge_enable &&
@@ -637,6 +696,28 @@ static int wcd_usbss_surge_kthread_fn(void *p)
 
 			release_runtime_env(wcd_usbss_ctxt_);
 		}
+#else /* OPLUS_BUG_COMPATIBILITY */
+		if (wcd_usbss_ctxt_->cable_status &&
+			wcd_usbss_ctxt_->surge_enable &&
+			!wcd_usbss_ctxt_->suspended &&
+			(acquire_runtime_env(wcd_usbss_ctxt_) >= 0)) {
+			if (wcd_usbss_is_in_reset_state()) {
+				/* Checking whether the surge occurs */
+				if (wcd_usbss_ctxt_->check_surge_workqueue) {
+					cancel_delayed_work_sync(&wcd_usbss_ctxt_->check_surge_delaywork);
+				}
+				wcd_usbss_reset_routine();
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+				if (!(wcd_usbss_ctxt_->cable_status & (BIT(WCD_USBSS_USB)))) {
+					mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_HEADSET_DET, MM_FB_KEY_RATELIMIT_5MIN, \
+					"payload@@negative surge occurs, cable_status = %d", wcd_usbss_ctxt_->cable_status);
+				}
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
+			}
+
+			release_runtime_env(wcd_usbss_ctxt_);
+		}
+#endif /* OPLUS_BUG_COMPATIBILITY */
 
 		msleep_interruptible(wcd_usbss_ctxt_->surge_timer_period_ms);
 	}
@@ -678,6 +759,34 @@ static void wcd_usbss_disable_surge_kthread(void)
 	wcd_usbss_ctxt_->surge_thread = NULL;
 }
 
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Checking whether the surge occurs */
+static void wcd_usbss_check_surge_work_fn(struct work_struct *work)
+{
+	struct wcd_usbss_ctxt *priv =
+		container_of(work, struct wcd_usbss_ctxt, check_surge_delaywork.work);
+
+	if (!priv) {
+		pr_err("%s: wcd usbss container invalid\n", __func__);
+		return;
+	}
+
+	if (priv->cable_status) {
+		if (acquire_runtime_env(wcd_usbss_ctxt_) >= 0) {
+			if(wcd_usbss_is_in_reset_state()) {
+				pr_err("%s: the surge event occurs, reset usbss\n", __func__);
+				wcd_usbss_reset_routine();
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+				mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_HEADSET_DET, MM_FB_KEY_RATELIMIT_5MIN, \
+					"payload@@usbss surge occurs, cable_status = %d", priv->cable_status);
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
+			}
+			release_runtime_env(wcd_usbss_ctxt_);
+		}
+	}
+}
+//#endif /* OPLUS_ARCH_EXTENDS */
+
 static int wcd_usbss_sysfs_init(struct wcd_usbss_ctxt *priv)
 {
 	int rc = 0;
@@ -716,6 +825,112 @@ static int wcd_usbss_sysfs_init(struct wcd_usbss_ctxt *priv)
 	return 0;
 }
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+static int typec_switch_to_fast_charger(struct wcd_usbss_ctxt *priv, unsigned long to_fast_charger)
+{
+	struct device *dev = NULL;
+	int ret = 0;
+
+	if (!priv)
+		return -EINVAL;
+
+	dev = priv->dev;
+	if (!dev)
+		return -EINVAL;
+
+	mutex_lock(&priv->noti_lock);
+	if (priv->cable_status & (BIT(WCD_USBSS_AATC) |
+		BIT(WCD_USBSS_GND_MIC_SWAP_AATC) |
+		BIT(WCD_USBSS_HSJ_CONNECT) |
+		BIT(WCD_USBSS_GND_MIC_SWAP_HSJ))) {
+		dev_info(dev, "%s: audio state can't change\n", __func__);
+
+		if ((priv->cable_status & BIT(WCD_USBSS_CHARGER)) && !to_fast_charger) {
+			priv->cable_status &= ~BIT(WCD_USBSS_CHARGER);
+			dev_info(dev, "%s: clear charge state\n", __func__);
+		}
+		mutex_unlock(&priv->noti_lock);
+		return ret;
+	}
+
+	dev_info(dev, "%s: to_fast_charger = %ld\n", __func__, to_fast_charger);
+	if (to_fast_charger) {
+		ret = wcd_usbss_switch_update(WCD_USBSS_CHARGER, WCD_USBSS_CABLE_CONNECT);
+		dev_info(dev, "%s, set to charge mode", __func__);
+	} else {
+		ret = wcd_usbss_switch_update(WCD_USBSS_CHARGER, WCD_USBSS_CABLE_DISCONNECT);
+		dev_info(dev, "%s, set to usb mode", __func__);
+	}
+	mutex_unlock(&priv->noti_lock);
+	return ret;
+}
+
+static int typec_switch_get_status(struct wcd_usbss_ctxt *priv)
+{
+	struct device *dev = NULL;
+	int rc = 0;
+
+	if (!priv)
+		return TYPEC_AUDIO_SWITCH_STATE_INVALID_PARAM;
+
+	dev = priv->dev;
+	if(!dev)
+		return TYPEC_AUDIO_SWITCH_STATE_INVALID_PARAM;
+
+	mutex_lock(&priv->noti_lock);
+	rc |= TYPEC_AUDIO_SWITCH_STATE_SUPPORT;
+	if ((WCD_USBSS_USB_MODE_SET == priv->wcd_standby_status) &&
+			(!priv->cable_status || (priv->cable_status & BIT(WCD_USBSS_USB)))) {
+		rc |= TYPEC_AUDIO_SWITCH_STATE_DPDM;
+	} else if (priv->cable_status & BIT(WCD_USBSS_CHARGER)) {
+		rc |= TYPEC_AUDIO_SWITCH_STATE_FAST_CHG;
+	} else if (priv->cable_status & (BIT(WCD_USBSS_AATC) |
+			BIT(WCD_USBSS_GND_MIC_SWAP_AATC) |
+			BIT(WCD_USBSS_HSJ_CONNECT) |
+			BIT(WCD_USBSS_GND_MIC_SWAP_HSJ))) {
+		rc |= TYPEC_AUDIO_SWITCH_STATE_AUDIO;
+	} else if ((WCD_USBSS_LPD_USB_MODE_CLEAR == priv->wcd_standby_status) && !priv->cable_status) {
+		rc |= TYPEC_AUDIO_SWITCH_STATE_STANDBY;
+	} else {
+		rc |= TYPEC_AUDIO_SWITCH_STATE_UNKNOW;
+	}
+	mutex_unlock(&priv->noti_lock);
+	dev_info(dev, "%s: cable_status: %d\n", __func__, rc);
+
+	return rc;
+}
+
+static int typec_switch_chg_event_changed(struct notifier_block *nb,
+				      unsigned long event, void *ptr)
+{
+	struct wcd_usbss_ctxt *priv =
+			container_of(nb, struct wcd_usbss_ctxt, chg_nb);
+	struct device *dev;
+
+	if (!priv)
+		return -EINVAL;
+
+	dev = priv->dev;
+	if (!dev)
+		return -EINVAL;
+
+	dev_info(dev, "%s: USB change event: %d received\n", __func__, event);
+
+	switch (event) {
+	case TYPEC_AUDIO_SWITCH_STATE_DPDM:
+	case TYPEC_AUDIO_SWITCH_STATE_FAST_CHG:
+		typec_switch_to_fast_charger(priv, event);
+		break;
+	case TYPEC_AUDIO_SWITCH_STATE_AUDIO:
+		return typec_switch_get_status(priv);
+	default:
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+#endif
+
 static int wcd_usbss_usbc_event_changed(struct notifier_block *nb,
 				      unsigned long evt, void *ptr)
 {
@@ -731,9 +946,11 @@ static int wcd_usbss_usbc_event_changed(struct notifier_block *nb,
 	if (!dev)
 		return -EINVAL;
 
-	dev_dbg(dev, "%s: USB change event received, supply mode %d, usbc mode %ld, expected %d\n",
+//#ifdef OPLUS_ARCH_EXTENDS
+	dev_info(dev, "%s: USB change event received, supply mode %d, usbc mode %ld, expected %d\n",
 			__func__, acc, priv->usbc_mode.counter,
 			TYPEC_ACCESSORY_AUDIO);
+//#endif /* OPLUS_ARCH_EXTENDS */
 
 	switch (acc) {
 	case TYPEC_ACCESSORY_AUDIO:
@@ -772,8 +989,10 @@ static int wcd_usbss_usbc_analog_setup_switches(struct wcd_usbss_ctxt *priv)
 	/* get latest mode again within locked context */
 	mode = atomic_read(&(priv->usbc_mode));
 
-	dev_dbg(dev, "%s: setting GPIOs active = %d cable_status = %d mode = %d\n",
+//#ifdef OPLUS_ARCH_EXTENDS
+	dev_info(dev, "%s: setting GPIOs active = %d cable_status = %d mode = %d\n",
 		__func__, mode != TYPEC_ACCESSORY_NONE, priv->cable_status, mode);
+//#endif /* OPLUS_ARCH_EXTENDS */
 
 	switch (mode) {
 	/* add all modes WCD USBSS should notify for in here */
@@ -1002,11 +1221,58 @@ int wcd_usbss_dpdm_switch_update(bool sw_en, bool eq_en)
 	if (ret)
 		pr_err("%s(): Failed to write equalizer1_en ret:%d\n", __func__, ret);
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	/* 8 is the default value. you can change as what you want to set like x.
+	 * x << 3, the x is the decimal value you want to write.
+	 */
+	if (eq_en && wcd_usbss_equalizer1) {
+		ret = regmap_update_bits(wcd_usbss_ctxt_->regmap, WCD_USBSS_EQUALIZER1,
+				WCD_USBSS_EQUALIZER1_BW_SETTINGS_MASK, wcd_usbss_equalizer1 << 3);
+		pr_err("%s(): write wcd_usbss_equalizer1:%d", __func__, wcd_usbss_equalizer1);
+	}
+#endif
+
 	release_runtime_env(wcd_usbss_ctxt_);
 
 	return ret;
 }
 EXPORT_SYMBOL(wcd_usbss_dpdm_switch_update);
+
+static int wcd_usbss_dpdm_switch_update_from_handler(bool sw_en, bool eq_en)
+{
+	int ret = 0;
+
+	/* check if driver is probed and private context is initialized */
+	if (wcd_usbss_ctxt_ == NULL)
+		return -ENODEV;
+
+	if (!wcd_usbss_ctxt_->regmap)
+		return -EINVAL;
+
+	ret = regmap_update_bits(wcd_usbss_ctxt_->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+				DPDM_SW_EN_MASK, (sw_en ? DPDM_SW_ENABLE : DPDM_SW_DISABLE));
+	if (ret)
+		pr_err("%s(): Failed to write dpdm_en_value ret:%d\n", __func__, ret);
+
+	ret = regmap_update_bits(wcd_usbss_ctxt_->regmap, WCD_USBSS_EQUALIZER1,
+				WCD_USBSS_EQUALIZER1_EQ_EN_MASK,
+				(eq_en ? WCD_USBSS_EQUALIZER1_EQ_EN_MASK : 0x0));
+	if (ret)
+		pr_err("%s(): Failed to write equalizer1_en ret:%d\n", __func__, ret);
+
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	/* 8 is the default value. you can change as what you want to set like x.
+	 * x << 3, the x is the decimal value you want to write.
+	 */
+	if (eq_en && wcd_usbss_equalizer1) {
+		ret = regmap_update_bits(wcd_usbss_ctxt_->regmap, WCD_USBSS_EQUALIZER1,
+				WCD_USBSS_EQUALIZER1_BW_SETTINGS_MASK, wcd_usbss_equalizer1 << 3);
+		pr_err("%s(): write wcd_usbss_equalizer1:%d", __func__, wcd_usbss_equalizer1);
+	}
+#endif
+
+	return ret;
+}
 
 /* wcd_usbss_audio_config - configure audio for power mode and Impedance calculations
  *
@@ -1105,6 +1371,9 @@ int wcd_usbss_switch_update(enum wcd_usbss_cable_types ctype,
 {
 	int i = 0, ret = 0;
 	bool audio_switch = false;
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	unsigned int debug_buf[10] = {0};
+#endif
 
 	/* check if driver is probed and private context is init'ed */
 	if (wcd_usbss_ctxt_ == NULL)
@@ -1112,6 +1381,13 @@ int wcd_usbss_switch_update(enum wcd_usbss_cable_types ctype,
 
 	if (!wcd_usbss_ctxt_->regmap)
 		return -EINVAL;
+
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Checking whether the surge occurs */
+	if (wcd_usbss_ctxt_->check_surge_workqueue) {
+		cancel_delayed_work_sync(&wcd_usbss_ctxt_->check_surge_delaywork);
+	}
+//#endif /* OPLUS_ARCH_EXTENDS */
 
 	mutex_lock(&wcd_usbss_ctxt_->switch_update_lock);
 
@@ -1165,6 +1441,21 @@ int wcd_usbss_switch_update(enum wcd_usbss_cable_types ctype,
 			wcd_usbss_ctxt_->cable_status &= ~BIT(WCD_USBSS_HSJ_CONNECT);
 			audio_switch = true;
 			break;
+#ifdef OPLUS_FEATURE_CHG_BASIC
+		case WCD_USBSS_CHARGER:
+			/* Disable DN DP Switches */
+			regmap_update_bits(wcd_usbss_ctxt_->regmap,
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE, 0x18, 0x00);
+			/* Select DN DP */
+			regmap_update_bits(wcd_usbss_ctxt_->regmap,
+					WCD_USBSS_SWITCH_SELECT0, 0x3C, 0x14);
+			/* Enable DN DP Switches */
+			regmap_update_bits(wcd_usbss_ctxt_->regmap,
+					WCD_USBSS_SWITCH_SETTINGS_ENABLE, 0x18, 0x18);
+			if (wcd_usbss_ctxt_->standby_enable && wcd_usbss_ctxt_->is_in_standby)
+				wcd_usbss_dpdm_switch_update(false, false);
+			break;
+#endif
 		default:
 			break;
 		}
@@ -1351,11 +1642,62 @@ int wcd_usbss_switch_update(enum wcd_usbss_cable_types ctype,
 						BIT(WCD_USBSS_GND_MIC_SWAP_AATC) |
 						BIT(WCD_USBSS_HSJ_CONNECT) |
 						BIT(WCD_USBSS_GND_MIC_SWAP_HSJ)))) {
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+			if (wcd_usbss_ctxt_->cable_status & (BIT(WCD_USBSS_USB) |
+							BIT(WCD_USBSS_DP_AUX_CC1) |
+							BIT(WCD_USBSS_DP_AUX_CC2) |
+							BIT(WCD_USBSS_CHARGER))) {
+				dev_err(wcd_usbss_ctxt_->dev, "error state 0x%x\n", wcd_usbss_ctxt_->cable_status);
+				mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_HEADSET_DET, MM_FB_KEY_RATELIMIT_5MIN, \
+					"payload@@wcd_usbss_switch_update error state 0x%x", wcd_usbss_ctxt_->cable_status);
+			}
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
 			wcd_usbss_ctxt_->wcd_standby_status = WCD_USBSS_AUDIO_MODE_SET;
 			dev_dbg(wcd_usbss_ctxt_->dev, "wcd state transition to %s complete\n",
 					status_to_str(wcd_usbss_ctxt_->wcd_standby_status));
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Checking whether the surge occurs */
+			if (wcd_usbss_ctxt_->check_surge_workqueue) {
+				dev_dbg(wcd_usbss_ctxt_->dev, "%s: queueing check_surge_workqueue\n",
+					__func__);
+				queue_delayed_work(wcd_usbss_ctxt_->check_surge_workqueue, &wcd_usbss_ctxt_->check_surge_delaywork, msecs_to_jiffies(200));
+			}
+//#endif /* OPLUS_ARCH_EXTENDS */
 		}
 	}
+
+//#ifdef OPLUS_ARCH_EXTENDS
+	pr_info("%s: Exit, cable_status = %d\n", __func__, wcd_usbss_ctxt_->cable_status);
+//#endif /* OPLUS_ARCH_EXTENDS */
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	for (i = 0; i < 8; ++i) {
+		ret = regmap_read(wcd_usbss_ctxt_->regmap, 0x400 + i, &debug_buf[i]);
+		if (ret != 0) {
+			printk(KERN_ERR "0x%x: read error, ", 0x400 + i);
+			debug_buf[i] = 0xffff;
+		}
+	}
+	printk(KERN_ERR "WCD switch registers[0x400~0x407]:0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x", debug_buf[0],
+		debug_buf[1],debug_buf[2], debug_buf[3], debug_buf[4], debug_buf[5], debug_buf[6], debug_buf[7]);
+	for (i = 0; i < 8; ++i) {
+		ret = regmap_read(wcd_usbss_ctxt_->regmap, 0x408 + i, &debug_buf[i]);
+		if (ret != 0) {
+			printk(KERN_ERR "0x%x: read error, ", 0x408 + i);
+			debug_buf[i] = 0xffff;
+		}
+	}
+	printk(KERN_ERR "WCD switch registers[0x408~0x40f]:0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x", debug_buf[0],
+		debug_buf[1],debug_buf[2], debug_buf[3], debug_buf[4], debug_buf[5], debug_buf[6], debug_buf[7]);
+	for (i = 0; i < 10; ++i) {
+		ret = regmap_read(wcd_usbss_ctxt_->regmap, 0x410 + i, &debug_buf[i]);
+		if (ret != 0) {
+			printk(KERN_ERR "0x%x: read error, ", 0x410 + i);
+			debug_buf[i] = 0xffff;
+		}
+	}
+	printk(KERN_ERR "WCD switch registers[0x410~0x419]:0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x", debug_buf[0],
+		debug_buf[1],debug_buf[2], debug_buf[3], debug_buf[4], debug_buf[5], debug_buf[6], debug_buf[7], debug_buf[8], debug_buf[9]);
+#endif
 
 	release_runtime_env(wcd_usbss_ctxt_);
 
@@ -1523,7 +1865,7 @@ static int wcd_usbss_sdam_handle_events_locked(int req_state)
 		regmap_update_bits(priv->regmap, WCD_USBSS_MG1_BIAS, 0x01, 0x01);
 		regmap_update_bits(priv->regmap, WCD_USBSS_MG2_BIAS, 0x01, 0x01);
 		/* Disconnect D+/D- switch */
-		wcd_usbss_dpdm_switch_update(false, false);
+		wcd_usbss_dpdm_switch_update_from_handler(false, false);
 
 		/* Enter standby */
 		wcd_usbss_standby_control_locked(true);
@@ -1582,6 +1924,14 @@ static irqreturn_t wcd_usbss_sdam_notifier_handler(int irq, void *data)
 	size_t len = 0;
 	int rc = 0;
 
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Add for avoiding ADSP notify wcd to switch to standy mode in the ftm mode */
+	if (boot_mode == MSM_BOOT_MODE__FACTORY) {
+		dev_err(priv->dev, "wcd_usbss_sdam_notifier_handler boot_mode:%d, force return\n", boot_mode);
+		return 0;
+	}
+//#endif /* OPLUS_ARCH_EXTENDS */
+
 	buf = nvmem_cell_read(priv->nvmem_cell, &len);
 	if (IS_ERR(buf)) {
 		rc = PTR_ERR(buf);
@@ -1589,9 +1939,14 @@ static irqreturn_t wcd_usbss_sdam_notifier_handler(int irq, void *data)
 		return rc;
 	}
 	buf[0] &= 0x3;
-	dev_dbg(priv->dev, "sdam notifier request:%d\n", buf[0]);
+//#ifdef OPLUS_ARCH_EXTENDS
+	dev_info(priv->dev, "sdam notifier request:%d\n", buf[0]);
+//#endif /* OPLUS_ARCH_EXTENDS */
 
 	mutex_lock(&wcd_usbss_ctxt_->switch_update_lock);
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	priv->sdam_handler = true;
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
 	if (buf[0] == priv->wcd_standby_status) {
 		dev_info(priv->dev, "%s: wcd already in %s mode:\n", __func__,
 				status_to_str(priv->wcd_standby_status));
@@ -1599,10 +1954,23 @@ static irqreturn_t wcd_usbss_sdam_notifier_handler(int irq, void *data)
 	}
 
 	rc = acquire_runtime_env(wcd_usbss_ctxt_);
-	if (rc < 0) {
+	if (rc == -EACCES) {
+		dev_dbg(priv->dev, "%s: acquire_runtime_env failed: %d, check suspend\n",
+				__func__, rc);
+	} else if (rc < 0) {
 		dev_err(priv->dev, "%s: acquire_runtime_env failed: %d\n",
 				__func__, rc);
 		goto unlock_mutex;
+	}
+
+	if (wcd_usbss_ctxt_->suspended) {
+		wcd_usbss_ctxt_->defer_writes = true;
+		wcd_usbss_ctxt_->req_state = buf[0];
+//#ifdef OPLUS_ARCH_EXTENDS
+		dev_info(priv->dev, "i2c in suspend, deferring %s transition to resume\n",
+				status_to_str(wcd_usbss_ctxt_->req_state));
+//#endif /* OPLUS_ARCH_EXTENDS */
+		goto release_runtime;
 	}
 
 	dev_dbg(priv->dev, "executing wcd state transition from %s to %s\n",
@@ -1611,12 +1979,18 @@ static irqreturn_t wcd_usbss_sdam_notifier_handler(int irq, void *data)
 	rc = wcd_usbss_sdam_handle_events_locked(buf[0]);
 	if (rc == 0) {
 		priv->wcd_standby_status = buf[0];
-		dev_dbg(priv->dev, "wcd state transition to %s complete\n",
+//#ifdef OPLUS_ARCH_EXTENDS
+		dev_info(priv->dev, "wcd state transition to %s complete\n",
 				status_to_str(priv->wcd_standby_status));
+//#endif /* OPLUS_ARCH_EXTENDS */
 	}
 
+release_runtime:
 	release_runtime_env(wcd_usbss_ctxt_);
 unlock_mutex:
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	priv->sdam_handler = false;
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
 	mutex_unlock(&wcd_usbss_ctxt_->switch_update_lock);
 	kfree(buf);
 	return IRQ_HANDLED;
@@ -1629,6 +2003,9 @@ static int wcd_usbss_sdam_registration(struct wcd_usbss_ctxt *priv)
 	if (!priv)
 		return -EINVAL;
 
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+	priv->sdam_handler = false;
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
 	priv->wcd_standby_status = WCD_USBSS_USB_MODE_SET;
 	priv->nvmem_cell = devm_nvmem_cell_get(priv->dev, "usb_mode");
 	if (IS_ERR(priv->nvmem_cell)) {
@@ -1661,11 +2038,17 @@ static int wcd_usbss_probe(struct i2c_client *i2c)
 	struct device *dev = &i2c->dev;
 	int rc = 0, i;
 	unsigned int ver = 0;
+//#ifdef OPLUS_BUG_COMPATIBILITY
+	unsigned int ovp_config = 0;
+//#endif /* OPLUS_BUG_COMPATIBILITY */
 
 	priv = devm_kzalloc(&i2c->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	priv->chg_registration = false;
+#endif
 	priv->dev = &i2c->dev;
 	priv->client = i2c;
 	priv->runtime_env_counter = 0;
@@ -1673,6 +2056,13 @@ static int wcd_usbss_probe(struct i2c_client *i2c)
 	mutex_init(&priv->switch_update_lock);
 	mutex_init(&priv->runtime_env_counter_lock);
 	i2c_set_clientdata(i2c, priv);
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Add for avoiding ADSP notify wcd to switch to standy mode in the ftm mode */
+	boot_mode = get_boot_mode();
+	dev_err(priv->dev, "wcd_usbss_probe boot_mode: %d\n", boot_mode);
+	if (boot_mode == MSM_BOOT_MODE__FACTORY)
+		wcd_usbss_switch_update(WCD_USBSS_USB, WCD_USBSS_CABLE_CONNECT);
+//#endif /* OPLUS_ARCH_EXTENDS */
 
 	pm_runtime_enable(dev);
 	pm_runtime_use_autosuspend(dev);
@@ -1707,6 +2097,11 @@ static int wcd_usbss_probe(struct i2c_client *i2c)
 		goto err_data;
 	}
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	device_property_read_u8(priv->dev, "qcom,wcd_usbss_equalizer1", &wcd_usbss_equalizer1);
+	dev_err(priv->dev, "wcd_usbss_equalizer1 configuration is 0x%x\n", wcd_usbss_equalizer1);
+#endif
+
 	rc = wcd_usbss_init_optional_reset_pins(priv);
 	if (rc) {
 		dev_dbg(priv->dev, "%s: Optional reset pin reset failed\n",
@@ -1725,9 +2120,28 @@ static int wcd_usbss_probe(struct i2c_client *i2c)
 	}
 
 	/* OVP-Fuse settings recommended from HW */
+#if 0 /* OPLUS_BUG_COMPATIBILITY */
 	regmap_update_bits(priv->regmap, WCD_USBSS_FSM_OVERRIDE, 0x77, 0x77);
 	regmap_update_bits(priv->regmap, WCD_USBSS_DP_EN, 0x0E, 0x08);
 	regmap_update_bits(priv->regmap, WCD_USBSS_DN_EN, 0x0E, 0x08);
+#else /* OPLUS_BUG_COMPATIBILITY */
+	device_property_read_u32(priv->dev, "oplus,wcd_usbss_ovp_config", &ovp_config);
+	dev_info(priv->dev, "wcd_usbss ovp config is %u", ovp_config);
+	if (ovp_config == WCD_USBSS_OVP_CONFIG_4P2) {
+		/*
+		 * Increase the ovp voltage to 4.2v to solve the problem of intermittent
+		 * charging after plugging and unplugging type-c in svooc charging scenario
+		 */
+		regmap_update_bits(priv->regmap, WCD_USBSS_FSM_OVERRIDE, 0x7F, 0x7F);
+		regmap_update_bits(priv->regmap, WCD_USBSS_DP_EN, 0x0E, 0x0C);
+		regmap_update_bits(priv->regmap, WCD_USBSS_DN_EN, 0x0E, 0x0C);
+	} else {
+		regmap_update_bits(priv->regmap, WCD_USBSS_FSM_OVERRIDE, 0x77, 0x77);
+		regmap_update_bits(priv->regmap, WCD_USBSS_DP_EN, 0x0E, 0x08);
+		regmap_update_bits(priv->regmap, WCD_USBSS_DN_EN, 0x0E, 0x08);
+	}
+#endif /* OPLUS_BUG_COMPATIBILITY */
+
 
 	/* Display common mode and OVP 4V updates */
 	regmap_update_bits(priv->regmap, WCD_USBSS_DISP_AUXP_CTL, 0x07, 0x01);
@@ -1765,6 +2179,23 @@ static int wcd_usbss_probe(struct i2c_client *i2c)
 	}
 
 	mutex_init(&priv->notification_lock);
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	priv->chg_nb.notifier_call = typec_switch_chg_event_changed;
+	priv->chg_nb.priority = 0;
+	rc = register_chg_glink_notifier(&priv->chg_nb);
+	if (rc) {
+		dev_err(priv->dev, "%s: ucsi glink notifier registration failed: %d\n",
+			__func__, rc);
+		rc = 0;
+		#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+		mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_HEADSET_DET, MM_FB_KEY_RATELIMIT_30MIN, \
+			"charge glink notifier registration failed");
+		#endif /* CONFIG_OPLUS_FEATURE_MM_FEEDBACK */
+	} else {
+		mutex_init(&priv->noti_lock);
+		priv->chg_registration = true;
+	}
+#endif
 
 	wcd_usbss_update_reg_init(priv->regmap);
 	INIT_WORK(&priv->usbc_analog_work,
@@ -1777,6 +2208,16 @@ static int wcd_usbss_probe(struct i2c_client *i2c)
 		priv->surge_enable = true;
 		wcd_usbss_enable_surge_kthread();
 	}
+
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Checking whether the surge occurs */
+	priv->check_surge_workqueue = create_singlethread_workqueue("wcd_usbss_check_surge_work_fn");
+	if (!priv->check_surge_workqueue) {
+		dev_err(priv->dev, "Failed to create_singlethread_workqueue\n");
+		goto err_data;
+	}
+	INIT_DELAYED_WORK(&priv->check_surge_delaywork, wcd_usbss_check_surge_work_fn);
+//#endif /* OPLUS_ARCH_EXTENDS */
 
 	release_runtime_env(wcd_usbss_ctxt_);
 	dev_info(priv->dev, "Probe completed!\n");
@@ -1798,9 +2239,14 @@ static void wcd_usbss_remove(struct i2c_client *i2c)
 		return;
 
 	error = pm_runtime_resume_and_get(priv->dev);
-	if (error < 0)
+	if (error < 0) {
 		dev_err(priv->dev, "%s: pm_runtime_resume_and_get failed: %i\n",
 				__func__, error);
+//#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
+		mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_HEADSET_DET, MM_FB_KEY_RATELIMIT_5MIN, \
+			"pm_runtime_resume_and_get failed: %i", error);
+//#endif /*CONFIG_OPLUS_FEATURE_MM_FEEDBACK*/
+	}
 
 	wcd_usbss_disable_surge_kthread();
 	unregister_ucsi_glink_notifier(&priv->ucsi_nb);
@@ -1816,13 +2262,30 @@ static void wcd_usbss_remove(struct i2c_client *i2c)
 	device_init_wakeup(priv->dev, false);
 	dev_set_drvdata(&i2c->dev, NULL);
 	wcd_usbss_ctxt_ = NULL;
+
+//#ifdef OPLUS_ARCH_EXTENDS
+/* Checking whether the surge occurs */
+	if (priv->check_surge_workqueue) {
+		cancel_delayed_work_sync(&priv->check_surge_delaywork);
+	}
+//#endif /* OPLUS_ARCH_EXTENDS */
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	if (priv->chg_registration) {
+		unregister_chg_glink_notifier(&priv->chg_nb);
+		mutex_destroy(&priv->noti_lock);
+	}
+#endif
 }
 
 #ifdef CONFIG_PM_SLEEP
 static int wcd_usbss_pm_suspend(struct device *dev)
 {
-	if (wcd_usbss_ctxt_)
-		wcd_usbss_ctxt_->suspended = true;
+	if (!wcd_usbss_ctxt_)
+		return 0;
+
+	mutex_lock(&wcd_usbss_ctxt_->switch_update_lock);
+	wcd_usbss_ctxt_->suspended = true;
+	mutex_unlock(&wcd_usbss_ctxt_->switch_update_lock);
 
 	dev_dbg(wcd_usbss_ctxt_->dev, "wcd usbss pm suspended");
 	return 0;
@@ -1830,10 +2293,29 @@ static int wcd_usbss_pm_suspend(struct device *dev)
 
 static int wcd_usbss_pm_resume(struct device *dev)
 {
+	int rc = 0;
+
 	if (!wcd_usbss_ctxt_)
 		return 0;
 
+	mutex_lock(&wcd_usbss_ctxt_->switch_update_lock);
+	if (wcd_usbss_ctxt_->defer_writes) {
+//#ifdef OPLUS_ARCH_EXTENDS
+		dev_info(wcd_usbss_ctxt_->dev, "wcd defer writes in progress");
+//#endif /* OPLUS_ARCH_EXTENDS */
+		rc = wcd_usbss_sdam_handle_events_locked(wcd_usbss_ctxt_->req_state);
+		wcd_usbss_ctxt_->defer_writes = false;
+		if (rc == 0) {
+			wcd_usbss_ctxt_->wcd_standby_status = wcd_usbss_ctxt_->req_state;
+//#ifdef OPLUS_ARCH_EXTENDS
+			dev_info(wcd_usbss_ctxt_->dev, "wcd state transition to %s complete\n",
+					status_to_str(wcd_usbss_ctxt_->wcd_standby_status));
+//#endif /* OPLUS_ARCH_EXTENDS */
+		}
+	}
 	wcd_usbss_ctxt_->suspended = false;
+	mutex_unlock(&wcd_usbss_ctxt_->switch_update_lock);
+
 	dev_dbg(wcd_usbss_ctxt_->dev, "wcd usbss pm resume completed");
 	return 0;
 }
