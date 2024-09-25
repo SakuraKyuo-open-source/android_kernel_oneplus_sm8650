@@ -16,7 +16,7 @@
 #include "oplus_guard_general.h"
 #include "oplus_kevent.h"
 /* for use oplus_task_struct */
-#include <../kernel/oplus_cpu/sched/sched_assist/sa_common.h>
+#include <../../../../kernel/oplus_cpu/sched/sched_assist/sa_common.h>
 
 #if defined(WHITE_LIST_SUPPORT)
 #include <linux/string.h>
